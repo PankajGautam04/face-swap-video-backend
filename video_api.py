@@ -1,4 +1,3 @@
-!pip install numpy==1.24.3 mediapipe==0.10.11 opencv-python==4.8.0.76 torch torchvision
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -13,14 +12,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from io import BytesIO
 import tempfile
 import os
+import uvicorn
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
-# Add CORS
+# Add CORS for faceswapmagic.netlify.app
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://faceswaptool.netlify.app"],
+    allow_origins=["https://faceswapmagic.netlify.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -99,7 +99,7 @@ class FaceWarper(nn.Module):
         d1 = self.sigmoid(self.dec1(torch.cat([d2, e1], dim=1)))
         return d1
 
-def train_model(video_path, epochs=10):
+def train_model(video_path, epochs=5):
     """Trains the model using the input video."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = FaceWarper().to(device)
