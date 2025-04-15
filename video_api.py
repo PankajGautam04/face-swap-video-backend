@@ -3,8 +3,6 @@ import mediapipe as mp
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
 import logging
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
@@ -46,36 +44,7 @@ def get_landmarks(image):
                  for landmark in results.multi_face_landmarks[0].landmark]
     return landmarks
 
-def extract_pairs(video_path):
-    """Extracts source-target pairs from a video for training."""
-    cap = cv2.VideoCapture(video_path)
-    frames, landmarks = [], []
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame = cv2.resize(frame, (256, 256))  # Resize to 256x256 for training
-        lm = get_landmarks(frame)
-        if lm:
-            frames.append(frame)
-            landmarks.append(lm)
-    cap.release()
-
-    if len(frames) < 2:
-        logging.error("Not enough frames with detected faces for training!")
-        return None
-
-    source_imgs = frames[:-1]
-    target_imgs = frames[1:]
-    source_lms = landmarks[:-1]
-    target_lms = landmarks[1:]
-
-    return (torch.tensor(np.array(source_imgs), dtype=torch.float32).permute(0, 3, 1, 2) / 255.0,
-            torch.tensor(np.array(source_lms), dtype=torch.float32) / 256.0,
-            torch.tensor(np.array(target_lms), dtype=torch.float32) / 256.0,
-            torch.tensor(np.array(target_imgs), dtype=torch.float32).permute(0, 3, 1, 2) / 255.0)
-
-# Define the Model
+# Define the Model (without training)
 class FaceWarper(nn.Module):
     def __init__(self):
         super(FaceWarper, self).__init__()
@@ -99,37 +68,8 @@ class FaceWarper(nn.Module):
         d1 = self.sigmoid(self.dec1(torch.cat([d2, e1], dim=1)))
         return d1
 
-def train_model(video_path, epochs=5):
-    """Trains the model using the input video."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = FaceWarper().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    criterion = nn.MSELoss()
-
-    data = extract_pairs(video_path)
-    if data is None:
-        return None
-    source_imgs, source_lms, target_lms, target_imgs = data
-    dataset = TensorDataset(source_imgs, source_lms, target_lms, target_imgs)
-    loader = DataLoader(dataset, batch_size=4, shuffle=True)
-
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-        for s_img, s_lm, t_lm, t_img in loader:
-            s_img, s_lm, t_lm, t_img = [x.to(device) for x in (s_img, s_lm, t_lm, t_img)]
-            optimizer.zero_grad()
-            output = model(s_img, s_lm, t_lm)
-            loss = criterion(output, t_img)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        logging.info(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss / len(loader):.4f}")
-
-    return model
-
 def warp_face(model, source_img, target_img, source_landmarks, target_landmarks):
-    """Warps source face using the trained neural model."""
+    """Warps source face using the neural model (untrained)."""
     device = next(model.parameters()).device
     source_img_resized = cv2.resize(source_img, (256, 256))
     target_img_resized = cv2.resize(target_img, (256, 256))
@@ -158,6 +98,14 @@ def seamless_face_swap(target_img, warped_face, target_landmarks):
     result_img = cv2.seamlessClone(blended, target_img, mask.astype(np.uint8) * 255, center, cv2.NORMAL_CLONE)
     return result_img
 
+def preprocess_frame(frame, max_size=480):
+    """Resizes the frame to reduce processing load."""
+    h, w = frame.shape[:2]
+    scale = max_size / max(h, w)
+    if scale < 1:
+        frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    return frame, scale
+
 async def process_video(source_image_data: bytes, target_video: UploadFile):
     """Processes the video by swapping faces with the source image."""
     # Load source image
@@ -175,10 +123,9 @@ async def process_video(source_image_data: bytes, target_video: UploadFile):
         output_path = output_temp.name
 
     try:
-        # Train the model using the target video
-        model = train_model(target_path, epochs=5)  # Reduced epochs for faster processing
-        if model is None:
-            raise HTTPException(status_code=400, detail="Training failed: Not enough frames with detected faces!")
+        # Initialize the model without training
+        device = torch.device("cpu")  # Force CPU for Render free tier
+        model = FaceWarper().to(device)
 
         cap = cv2.VideoCapture(target_path)
         if not cap.isOpened():
@@ -201,12 +148,16 @@ async def process_video(source_image_data: bytes, target_video: UploadFile):
             if not ret:
                 break
 
-            target_landmarks = get_landmarks(frame)
+            # Resize frame for processing
+            frame_resized, scale = preprocess_frame(frame)
+            target_landmarks = get_landmarks(frame_resized)
             if target_landmarks is None:
                 out.write(frame)
                 continue
 
-            warped_face = warp_face(model, source_img, frame, source_landmarks, target_landmarks)
+            # Scale landmarks back to original size
+            target_landmarks = [(int(x / scale), int(y / scale)) for x, y in target_landmarks]
+            warped_face = warp_face(model, source_img, frame_resized, source_landmarks, target_landmarks)
             warped_face_resized = cv2.resize(warped_face, (frame.shape[1], frame.shape[0]))
             result_frame = seamless_face_swap(frame, warped_face_resized, target_landmarks)
 
