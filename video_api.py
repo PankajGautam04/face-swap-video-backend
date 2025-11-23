@@ -1,4 +1,4 @@
-# video_api.py
+# video_api.py (downscale-first, output downscaled video)
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -6,17 +6,15 @@ import logging
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from io import BytesIO
 import tempfile
 import os
-import math
 import uvicorn
 from typing import List, Tuple, Generator
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
-# CORS: allow your frontend origin (adjust if needed)
+# Adjust allowed origins to your frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://faceswapmagic.netlify.app"],
@@ -35,8 +33,8 @@ face_mesh = mp_face_mesh.FaceMesh(
     min_tracking_confidence=0.5
 )
 
-def get_landmarks(image: np.ndarray) -> List[Tuple[int,int]] | None:
-    """Detect facial landmarks and return list of (x,y) tuples in image coordinates."""
+
+def get_landmarks(image: np.ndarray) -> List[Tuple[int, int]] | None:
     img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(img_rgb)
     if not results.multi_face_landmarks:
@@ -48,20 +46,20 @@ def get_landmarks(image: np.ndarray) -> List[Tuple[int,int]] | None:
         landmarks.append((x, y))
     return landmarks
 
-def find_nearest_index(pt: Tuple[float,float], points: List[Tuple[int,int]], tol: int = 3) -> int:
-    """Find index of nearest point in points to pt. Return -1 if none within tol pixels."""
+
+def find_nearest_index(pt: Tuple[float, float], points: List[Tuple[int, int]], tol: int = 3) -> int:
     px, py = int(round(pt[0])), int(round(pt[1]))
     best_i = -1
     best_d2 = tol * tol + 1
-    for i, (x,y) in enumerate(points):
+    for i, (x, y) in enumerate(points):
         d2 = (x - px) * (x - px) + (y - py) * (y - py)
         if d2 < best_d2:
             best_d2 = d2
             best_i = i
     return best_i
 
-def delaunay_triangles_indices(points: List[Tuple[int,int]], rect) -> List[Tuple[int,int,int]]:
-    """Compute Delaunay triangles on points (using Subdiv2D), return triangles as indices into points."""
+
+def delaunay_triangles_indices(points: List[Tuple[int, int]], rect) -> List[Tuple[int, int, int]]:
     subdiv = cv2.Subdiv2D(rect)
     for p in points:
         subdiv.insert((int(p[0]), int(p[1])))
@@ -77,7 +75,6 @@ def delaunay_triangles_indices(points: List[Tuple[int,int]], rect) -> List[Tuple
         i3 = find_nearest_index(pt3, pts)
         if i1 != -1 and i2 != -1 and i3 != -1 and i1 != i2 and i2 != i3 and i1 != i3:
             triangles.append((i1, i2, i3))
-    # remove duplicates (unordered)
     unique = []
     seen = set()
     for tri in triangles:
@@ -87,16 +84,13 @@ def delaunay_triangles_indices(points: List[Tuple[int,int]], rect) -> List[Tuple
             unique.append(tri)
     return unique
 
+
 def warp_face(source_img: np.ndarray, target_img: np.ndarray,
-              source_landmarks: List[Tuple[int,int]], target_landmarks: List[Tuple[int,int]]) -> np.ndarray:
-    """Warp the source face into the target image coordinate space. Both landmark lists are expected
-       to be in the respective image coordinate systems (same size for src and tgt passed to this function)."""
-    # hull and rect for Delaunay
+              source_landmarks: List[Tuple[int, int]], target_landmarks: List[Tuple[int, int]]) -> np.ndarray:
     hull_src = cv2.convexHull(np.array(source_landmarks, dtype=np.int32))
     rect = cv2.boundingRect(hull_src)
     if rect[2] <= 0 or rect[3] <= 0:
         return np.zeros_like(target_img)
-    # compute triangles as indices
     triangles = delaunay_triangles_indices(source_landmarks, rect)
     if not triangles:
         return np.zeros_like(target_img)
@@ -109,74 +103,57 @@ def warp_face(source_img: np.ndarray, target_img: np.ndarray,
         dst_tri = np.float32([target_landmarks[tri[0]], target_landmarks[tri[1]], target_landmarks[tri[2]]])
 
         try:
-            # compute affine transform
             M = cv2.getAffineTransform(src_tri, dst_tri)
         except Exception:
             continue
 
-        # bounding rect of destination triangle for mask & warp region performance
         r = cv2.boundingRect(np.array(dst_tri, dtype=np.int32))
         x, y, w, h = r
         if w <= 0 or h <= 0:
             continue
 
-        src_rect = cv2.boundingRect(np.array(src_tri, dtype=np.int32))
-        sx, sy, sw, sh = src_rect
-        # extract source patch
-        src_patch = source_img[sy:sy+sh, sx:sx+sw]
-        if src_patch.size == 0:
-            continue
-
-        # warp the whole source image with M into target shape, but only crop the region to reduce work
         warp_patch = cv2.warpAffine(source_img, M, (w_t, h_t), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-        # create mask for triangle in destination rectangle coordinates
         mask = np.zeros((h, w), dtype=np.uint8)
         dst_tri_shifted = np.array([[dst_tri[0][0] - x, dst_tri[0][1] - y],
                                     [dst_tri[1][0] - x, dst_tri[1][1] - y],
                                     [dst_tri[2][0] - x, dst_tri[2][1] - y]], dtype=np.int32)
         cv2.fillConvexPoly(mask, dst_tri_shifted, 255)
 
-        # overlay warp_patch region
-        warp_sub = warp_patch[y:y+h, x:x+w]
+        warp_sub = warp_patch[y:y + h, x:x + w]
         if warp_sub.shape[0] != h or warp_sub.shape[1] != w:
-            # skip if sizes mismatch
             continue
 
-        # apply mask
         inv_mask = cv2.bitwise_not(mask)
-        roi = warped[y:y+h, x:x+w]
+        roi = warped[y:y + h, x:x + w]
         bg = cv2.bitwise_and(roi, roi, mask=inv_mask)
         fg = cv2.bitwise_and(warp_sub, warp_sub, mask=mask)
         merged = cv2.add(bg, fg)
-        warped[y:y+h, x:x+w] = merged
+        warped[y:y + h, x:x + w] = merged
 
     return warped
 
-def seamless_face_swap(target_img: np.ndarray, warped_face: np.ndarray, target_landmarks: List[Tuple[int,int]]) -> np.ndarray:
-    """Blend warped_face into target_img using the convex hull of target landmarks."""
+
+def seamless_face_swap(target_img: np.ndarray, warped_face: np.ndarray, target_landmarks: List[Tuple[int, int]]) -> np.ndarray:
     if warped_face is None or warped_face.sum() == 0:
         return target_img
     mask = np.zeros(target_img.shape[:2], dtype=np.uint8)
     hull = cv2.convexHull(np.array(target_landmarks, dtype=np.int32))
     cv2.fillConvexPoly(mask, hull, 255)
-    # smooth mask to make blending less harsh
-    mask = cv2.dilate(mask, np.ones((15,15), np.uint8), iterations=1)
-    mask_blur = cv2.GaussianBlur(mask, (31,31), 11)
-    mask_3 = cv2.merge([mask_blur, mask_blur, mask_blur]).astype(np.float32)/255.0
+    mask = cv2.dilate(mask, np.ones((15, 15), np.uint8), iterations=1)
+    mask_blur = cv2.GaussianBlur(mask, (31, 31), 11)
+    mask_3 = cv2.merge([mask_blur, mask_blur, mask_blur]).astype(np.float32) / 255.0
     warped_f = warped_face.astype(np.float32)
     target_f = target_img.astype(np.float32)
     blended = (warped_f * mask_3 + target_f * (1.0 - mask_3)).astype(np.uint8)
-    # center for seamlessClone
-    center = (int(np.mean(hull[:,0,0])), int(np.mean(hull[:,0,1])))
+    center = (int(np.mean(hull[:, 0, 0])), int(np.mean(hull[:, 0, 1])))
     try:
         result = cv2.seamlessClone(blended, target_img, (mask_blur).astype(np.uint8), center, cv2.NORMAL_CLONE)
         return result
     except Exception:
-        # if seamlessClone fails, return blended as fallback
         return blended
 
+
 def chunked_file_reader(path: str, chunk_size: int = 65536) -> Generator[bytes, None, None]:
-    """Yield file content in chunks then remove file (cleanup)."""
     try:
         with open(path, 'rb') as f:
             while True:
@@ -190,8 +167,9 @@ def chunked_file_reader(path: str, chunk_size: int = 65536) -> Generator[bytes, 
         except Exception:
             logging.exception("Failed to remove temp file: %s", path)
 
-async def process_video(source_image_data: bytes, target_video: UploadFile, max_process_size: int = 360):
-    logging.info("Starting video processing...")
+
+async def process_video_downscaled(source_image_data: bytes, target_video: UploadFile, max_process_size: int = 360):
+    logging.info("Starting downscale-first video processing...")
     source_img = cv2.imdecode(np.frombuffer(source_image_data, np.uint8), cv2.IMREAD_COLOR)
     if source_img is None:
         logging.error("Invalid source image")
@@ -203,7 +181,7 @@ async def process_video(source_image_data: bytes, target_video: UploadFile, max_
         ttmp.write(await target_video.read())
     logging.info("Target video saved to %s", target_path)
 
-    # temp output
+    # prepare output temp file
     out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     output_path = out_tmp.name
     out_tmp.close()
@@ -217,22 +195,23 @@ async def process_video(source_image_data: bytes, target_video: UploadFile, max_
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    logging.info("Video properties - %dx%d @ %.2f fps", frame_width, frame_height, fps)
+    logging.info("Original video properties - %dx%d @ %.2f fps", frame_width, frame_height, fps)
 
-    # choose processing size (smaller of max_process_size and largest dimension)
-    proc_scale = 1.0
+    # compute processing (downscale) resolution
     max_dim = max(frame_width, frame_height)
+    proc_scale = 1.0
     if max_dim > max_process_size:
         proc_scale = max_process_size / float(max_dim)
     proc_w = max(1, int(frame_width * proc_scale))
     proc_h = max(1, int(frame_height * proc_scale))
-    logging.info("Processing resolution set to %dx%d (scale=%.3f)", proc_w, proc_h, proc_scale)
+    logging.info("Processing (and output) resolution set to %dx%d (scale=%.3f)", proc_w, proc_h, proc_scale)
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
-    logging.info("Initialized writer to %s", output_path)
+    # IMPORTANT: write output at the downscaled size
+    out = cv2.VideoWriter(output_path, fourcc, fps, (proc_w, proc_h))
+    logging.info("Initialized downscaled writer to %s", output_path)
 
-    # We'll detect landmarks on a resized source image to match processing resolution
+    # resize source to processing resolution
     source_resized = cv2.resize(source_img, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
     source_landmarks_resized = get_landmarks(source_resized)
     if source_landmarks_resized is None:
@@ -243,7 +222,7 @@ async def process_video(source_image_data: bytes, target_video: UploadFile, max_
         logging.error("No face in source image")
         raise HTTPException(status_code=400, detail="No face detected in the source image.")
 
-    logging.info("Source landmarks obtained")
+    logging.info("Source landmarks obtained (downscaled)")
 
     frame_count = 0
     processed_frames = 0
@@ -254,31 +233,27 @@ async def process_video(source_image_data: bytes, target_video: UploadFile, max_
                 break
             frame_count += 1
 
-            # create a smaller frame for processing
+            # downscale frame for processing
             frame_proc = cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
 
             target_landmarks_proc = get_landmarks(frame_proc)
             if target_landmarks_proc is None:
-                # no face detected — write original frame
-                out.write(frame)
+                # no face: write downscaled original frame (keeps output consistent)
+                out.write(frame_proc)
                 continue
 
-            # warp using resized source and resized target landmarks, then upscale warped face to original frame size
             try:
                 warped_small = warp_face(source_resized, frame_proc, source_landmarks_resized, target_landmarks_proc)
                 if warped_small is None or warped_small.sum() == 0:
-                    # fallback: write original
-                    out.write(frame)
+                    out.write(frame_proc)
                     continue
-                warped_up = cv2.resize(warped_small, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
-                # need to scale landmarks back to original frame size for blending
-                target_landmarks_full = [(int(x / proc_scale), int(y / proc_scale)) for (x, y) in target_landmarks_proc]
-                result_frame = seamless_face_swap(frame, warped_up, target_landmarks_full)
+                # result is already at proc resolution, blend using proc landmarks
+                result_frame = seamless_face_swap(frame_proc, warped_small, target_landmarks_proc)
                 out.write(result_frame)
                 processed_frames += 1
             except Exception as e:
                 logging.exception("Frame %d processing failed: %s", frame_count, str(e))
-                out.write(frame)  # fallback
+                out.write(frame_proc)  # fallback
 
             if frame_count % 50 == 0:
                 logging.info("Processed %d frames (written %d processed)", frame_count, processed_frames)
@@ -288,11 +263,11 @@ async def process_video(source_image_data: bytes, target_video: UploadFile, max_
         out.release()
         logging.info("Finished processing. Frames read: %d, frames processed: %d", frame_count, processed_frames)
 
-    # stream the file back in chunks to avoid loading entire file into memory
-    logging.info("Streaming result from %s", output_path)
+    # stream downscaled file back
+    logging.info("Streaming downscaled result from %s", output_path)
     return StreamingResponse(chunked_file_reader(output_path), media_type="video/mp4",
-                             headers={"Content-Disposition": "attachment; filename=swapped_video_result.mp4"},
-                             )
+                             headers={"Content-Disposition": "attachment; filename=swapped_video_downscaled.mp4"})
+
 
 @app.post("/swap-video/")
 async def swap_video(source_image: UploadFile = File(...), target_video: UploadFile = File(...)):
@@ -304,18 +279,18 @@ async def swap_video(source_image: UploadFile = File(...), target_video: UploadF
         if not target_video.content_type.startswith('video/'):
             logging.error("Target must be video")
             raise HTTPException(status_code=400, detail="Target must be a video file.")
-        # very rough size checks (fastfail if huge)
         source_data = await source_image.read()
-        if len(source_data) > 8_000_000:  # allow up to 8MB but you can reduce if needed
+        if len(source_data) > 8_000_000:
             logging.error("Source image too large")
             raise HTTPException(status_code=400, detail="Source image too large (max 8MB).")
-        # Note: UploadFile.size might not be set; don't rely on it. We limit by processing time instead.
-        return await process_video(source_data, target_video, max_process_size=360)
+        # Use a reasonable default (360). Lower to 240 or 180 on extremely constrained hosts.
+        return await process_video_downscaled(source_data, target_video, max_process_size=360)
     except HTTPException:
         raise
     except Exception as e:
         logging.exception("Error processing video")
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
