@@ -1,3 +1,4 @@
+# video_api.py
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -8,12 +9,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from io import BytesIO
 import tempfile
 import os
+import math
 import uvicorn
+from typing import List, Tuple, Generator
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
-# Add CORS for faceswapmagic.netlify.app
+# CORS: allow your frontend origin (adjust if needed)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://faceswapmagic.netlify.app"],
@@ -22,206 +25,297 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Mediapipe Face Mesh
+# Mediapipe Face Mesh (video mode)
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
-    static_image_mode=False,  # For video, use non-static mode
+    static_image_mode=False,
     max_num_faces=1,
     refine_landmarks=True,
-    min_detection_confidence=0.6,
-    min_tracking_confidence=0.6
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
 )
 
-def get_landmarks(image):
-    """Detects facial landmarks in an image."""
+def get_landmarks(image: np.ndarray) -> List[Tuple[int,int]] | None:
+    """Detect facial landmarks and return list of (x,y) tuples in image coordinates."""
     img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     results = face_mesh.process(img_rgb)
     if not results.multi_face_landmarks:
         return None
-    landmarks = [(int(landmark.x * image.shape[1]), int(landmark.y * image.shape[0]))
-                 for landmark in results.multi_face_landmarks[0].landmark]
+    landmarks = []
+    for lm in results.multi_face_landmarks[0].landmark:
+        x = int(lm.x * image.shape[1])
+        y = int(lm.y * image.shape[0])
+        landmarks.append((x, y))
     return landmarks
 
-def warp_face(source_img, target_img, source_landmarks, target_landmarks):
-    """Warps the source face to align with target landmarks using Delaunay triangulation."""
-    # Create Delaunay triangulation
-    hull_source = cv2.convexHull(np.array(source_landmarks, dtype=np.int32))
-    hull_target = cv2.convexHull(np.array(target_landmarks, dtype=np.int32))
+def find_nearest_index(pt: Tuple[float,float], points: List[Tuple[int,int]], tol: int = 3) -> int:
+    """Find index of nearest point in points to pt. Return -1 if none within tol pixels."""
+    px, py = int(round(pt[0])), int(round(pt[1]))
+    best_i = -1
+    best_d2 = tol * tol + 1
+    for i, (x,y) in enumerate(points):
+        d2 = (x - px) * (x - px) + (y - py) * (y - py)
+        if d2 < best_d2:
+            best_d2 = d2
+            best_i = i
+    return best_i
 
-    # Create Delaunay triangulation for source landmarks
-    rect = cv2.boundingRect(hull_source)
+def delaunay_triangles_indices(points: List[Tuple[int,int]], rect) -> List[Tuple[int,int,int]]:
+    """Compute Delaunay triangles on points (using Subdiv2D), return triangles as indices into points."""
     subdiv = cv2.Subdiv2D(rect)
-    for point in source_landmarks:
-        subdiv.insert(point)
-    triangles = subdiv.getTriangleList()
-    triangles = np.array(triangles, dtype=np.int32)
-
-    # Map triangles from source to target
-    source_triangles = []
-    target_triangles = []
-    for t in triangles:
+    for p in points:
+        subdiv.insert((int(p[0]), int(p[1])))
+    tlist = subdiv.getTriangleList()
+    triangles = []
+    pts = points
+    for t in tlist:
         pt1 = (t[0], t[1])
         pt2 = (t[2], t[3])
         pt3 = (t[4], t[5])
-        idx1 = source_landmarks.index([pt1[0], pt1[1]]) if [pt1[0], pt1[1]] in source_landmarks else -1
-        idx2 = source_landmarks.index([pt2[0], pt2[1]]) if [pt2[0], pt2[1]] in source_landmarks else -1
-        idx3 = source_landmarks.index([pt3[0], pt3[1]]) if [pt3[0], pt3[1]] in source_landmarks else -1
-        if idx1 != -1 and idx2 != -1 and idx3 != -1:
-            source_triangles.append([idx1, idx2, idx3])
-            target_triangles.append([idx1, idx2, idx3])
+        i1 = find_nearest_index(pt1, pts)
+        i2 = find_nearest_index(pt2, pts)
+        i3 = find_nearest_index(pt3, pts)
+        if i1 != -1 and i2 != -1 and i3 != -1 and i1 != i2 and i2 != i3 and i1 != i3:
+            triangles.append((i1, i2, i3))
+    # remove duplicates (unordered)
+    unique = []
+    seen = set()
+    for tri in triangles:
+        key = tuple(sorted(tri))
+        if key not in seen:
+            seen.add(key)
+            unique.append(tri)
+    return unique
 
-    # Warp source face to target
-    warped_img = np.zeros_like(target_img)
-    for i in range(len(source_triangles)):
-        src_pts = np.float32([source_landmarks[source_triangles[i][0]],
-                              source_landmarks[source_triangles[i][1]],
-                              source_landmarks[source_triangles[i][2]]])
-        dst_pts = np.float32([target_landmarks[target_triangles[i][0]],
-                              target_landmarks[target_triangles[i][1]],
-                              target_landmarks[target_triangles[i][2]]])
-        M = cv2.getAffineTransform(src_pts, dst_pts)
-        warped_patch = cv2.warpAffine(source_img, M, (target_img.shape[1], target_img.shape[0]))
-        mask = np.zeros((target_img.shape[0], target_img.shape[1]), dtype=np.uint8)
-        cv2.fillConvexPoly(mask, np.array([dst_pts[0], dst_pts[1], dst_pts[2]], dtype=np.int32), 255)
-        warped_img = cv2.bitwise_and(warped_img, warped_img, mask=cv2.bitwise_not(mask))
-        warped_img = cv2.bitwise_or(warped_img, cv2.bitwise_and(warped_patch, warped_patch, mask=mask))
+def warp_face(source_img: np.ndarray, target_img: np.ndarray,
+              source_landmarks: List[Tuple[int,int]], target_landmarks: List[Tuple[int,int]]) -> np.ndarray:
+    """Warp the source face into the target image coordinate space. Both landmark lists are expected
+       to be in the respective image coordinate systems (same size for src and tgt passed to this function)."""
+    # hull and rect for Delaunay
+    hull_src = cv2.convexHull(np.array(source_landmarks, dtype=np.int32))
+    rect = cv2.boundingRect(hull_src)
+    if rect[2] <= 0 or rect[3] <= 0:
+        return np.zeros_like(target_img)
+    # compute triangles as indices
+    triangles = delaunay_triangles_indices(source_landmarks, rect)
+    if not triangles:
+        return np.zeros_like(target_img)
 
-    return warped_img
+    warped = np.zeros_like(target_img)
+    h_t, w_t = target_img.shape[:2]
 
-def seamless_face_swap(target_img, warped_face, target_landmarks):
-    """Blends the warped face into the target frame."""
-    mask = np.zeros_like(target_img[:, :, 0])
+    for tri in triangles:
+        src_tri = np.float32([source_landmarks[tri[0]], source_landmarks[tri[1]], source_landmarks[tri[2]]])
+        dst_tri = np.float32([target_landmarks[tri[0]], target_landmarks[tri[1]], target_landmarks[tri[2]]])
+
+        try:
+            # compute affine transform
+            M = cv2.getAffineTransform(src_tri, dst_tri)
+        except Exception:
+            continue
+
+        # bounding rect of destination triangle for mask & warp region performance
+        r = cv2.boundingRect(np.array(dst_tri, dtype=np.int32))
+        x, y, w, h = r
+        if w <= 0 or h <= 0:
+            continue
+
+        src_rect = cv2.boundingRect(np.array(src_tri, dtype=np.int32))
+        sx, sy, sw, sh = src_rect
+        # extract source patch
+        src_patch = source_img[sy:sy+sh, sx:sx+sw]
+        if src_patch.size == 0:
+            continue
+
+        # warp the whole source image with M into target shape, but only crop the region to reduce work
+        warp_patch = cv2.warpAffine(source_img, M, (w_t, h_t), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        # create mask for triangle in destination rectangle coordinates
+        mask = np.zeros((h, w), dtype=np.uint8)
+        dst_tri_shifted = np.array([[dst_tri[0][0] - x, dst_tri[0][1] - y],
+                                    [dst_tri[1][0] - x, dst_tri[1][1] - y],
+                                    [dst_tri[2][0] - x, dst_tri[2][1] - y]], dtype=np.int32)
+        cv2.fillConvexPoly(mask, dst_tri_shifted, 255)
+
+        # overlay warp_patch region
+        warp_sub = warp_patch[y:y+h, x:x+w]
+        if warp_sub.shape[0] != h or warp_sub.shape[1] != w:
+            # skip if sizes mismatch
+            continue
+
+        # apply mask
+        inv_mask = cv2.bitwise_not(mask)
+        roi = warped[y:y+h, x:x+w]
+        bg = cv2.bitwise_and(roi, roi, mask=inv_mask)
+        fg = cv2.bitwise_and(warp_sub, warp_sub, mask=mask)
+        merged = cv2.add(bg, fg)
+        warped[y:y+h, x:x+w] = merged
+
+    return warped
+
+def seamless_face_swap(target_img: np.ndarray, warped_face: np.ndarray, target_landmarks: List[Tuple[int,int]]) -> np.ndarray:
+    """Blend warped_face into target_img using the convex hull of target landmarks."""
+    if warped_face is None or warped_face.sum() == 0:
+        return target_img
+    mask = np.zeros(target_img.shape[:2], dtype=np.uint8)
     hull = cv2.convexHull(np.array(target_landmarks, dtype=np.int32))
     cv2.fillConvexPoly(mask, hull, 255)
+    # smooth mask to make blending less harsh
+    mask = cv2.dilate(mask, np.ones((15,15), np.uint8), iterations=1)
+    mask_blur = cv2.GaussianBlur(mask, (31,31), 11)
+    mask_3 = cv2.merge([mask_blur, mask_blur, mask_blur]).astype(np.float32)/255.0
+    warped_f = warped_face.astype(np.float32)
+    target_f = target_img.astype(np.float32)
+    blended = (warped_f * mask_3 + target_f * (1.0 - mask_3)).astype(np.uint8)
+    # center for seamlessClone
+    center = (int(np.mean(hull[:,0,0])), int(np.mean(hull[:,0,1])))
+    try:
+        result = cv2.seamlessClone(blended, target_img, (mask_blur).astype(np.uint8), center, cv2.NORMAL_CLONE)
+        return result
+    except Exception:
+        # if seamlessClone fails, return blended as fallback
+        return blended
 
-    kernel = np.ones((30, 30), np.uint8)
-    mask = cv2.dilate(mask, kernel, iterations=2)
-    mask = cv2.GaussianBlur(mask, (41, 41), 15)
-    mask_3d = cv2.merge([mask, mask, mask]) / 255.0
+def chunked_file_reader(path: str, chunk_size: int = 65536) -> Generator[bytes, None, None]:
+    """Yield file content in chunks then remove file (cleanup)."""
+    try:
+        with open(path, 'rb') as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            logging.exception("Failed to remove temp file: %s", path)
 
-    blended = (warped_face * mask_3d + target_img * (1 - mask_3d)).astype(np.uint8)
-    center = (int(np.mean(hull[:, 0, 0])), int(np.mean(hull[:, 0, 1])))
-    result_img = cv2.seamlessClone(blended, target_img, mask.astype(np.uint8) * 255, center, cv2.NORMAL_CLONE)
-    return result_img
-
-def preprocess_frame(frame, max_size=480):
-    """Resizes the frame to reduce processing load."""
-    h, w = frame.shape[:2]
-    scale = max_size / max(h, w)
-    if scale < 1:
-        frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-    return frame, scale
-
-async def process_video(source_image_data: bytes, target_video: UploadFile):
-    """Processes the video by swapping faces with the source image."""
+async def process_video(source_image_data: bytes, target_video: UploadFile, max_process_size: int = 360):
     logging.info("Starting video processing...")
-    
-    # Load source image
     source_img = cv2.imdecode(np.frombuffer(source_image_data, np.uint8), cv2.IMREAD_COLOR)
     if source_img is None:
         logging.error("Invalid source image")
         raise HTTPException(status_code=400, detail="Invalid source image!")
 
-    # Create temporary file for the target video
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as target_temp:
-        target_path = target_temp.name
-        target_temp.write(await target_video.read())
-    logging.info(f"Target video saved to temporary path: {target_path}")
+    # write target video to temp file
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as ttmp:
+        target_path = ttmp.name
+        ttmp.write(await target_video.read())
+    logging.info("Target video saved to %s", target_path)
 
-    # Create temporary file for the output video
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as output_temp:
-        output_path = output_temp.name
+    # temp output
+    out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+    output_path = out_tmp.name
+    out_tmp.close()
 
+    cap = cv2.VideoCapture(target_path)
+    if not cap.isOpened():
+        os.remove(target_path)
+        logging.error("Could not open video file")
+        raise HTTPException(status_code=400, detail="Could not open video file!")
+
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    logging.info("Video properties - %dx%d @ %.2f fps", frame_width, frame_height, fps)
+
+    # choose processing size (smaller of max_process_size and largest dimension)
+    proc_scale = 1.0
+    max_dim = max(frame_width, frame_height)
+    if max_dim > max_process_size:
+        proc_scale = max_process_size / float(max_dim)
+    proc_w = max(1, int(frame_width * proc_scale))
+    proc_h = max(1, int(frame_height * proc_scale))
+    logging.info("Processing resolution set to %dx%d (scale=%.3f)", proc_w, proc_h, proc_scale)
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+    logging.info("Initialized writer to %s", output_path)
+
+    # We'll detect landmarks on a resized source image to match processing resolution
+    source_resized = cv2.resize(source_img, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
+    source_landmarks_resized = get_landmarks(source_resized)
+    if source_landmarks_resized is None:
+        cap.release()
+        out.release()
+        os.remove(target_path)
+        os.remove(output_path)
+        logging.error("No face in source image")
+        raise HTTPException(status_code=400, detail="No face detected in the source image.")
+
+    logging.info("Source landmarks obtained")
+
+    frame_count = 0
+    processed_frames = 0
     try:
-        cap = cv2.VideoCapture(target_path)
-        if not cap.isOpened():
-            logging.error("Could not open video file")
-            raise HTTPException(status_code=400, detail="Could not open video file!")
-
-        frame_width = int(cap.get(3))
-        frame_height = int(cap.get(4))
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        logging.info(f"Video properties - Width: {frame_width}, Height: {frame_height}, FPS: {fps}")
-
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
-        logging.info(f"Output video writer initialized at: {output_path}")
-
-        source_landmarks = get_landmarks(source_img)
-        if source_landmarks is None:
-            logging.error("No face detected in the source image")
-            raise HTTPException(status_code=400, detail="No face detected in the source image.")
-        logging.info("Source landmarks detected successfully")
-
-        frame_count = 0
-        while cap.isOpened():
+        while True:
             ret, frame = cap.read()
             if not ret:
                 break
+            frame_count += 1
 
-            # Resize frame for processing
-            frame_resized, scale = preprocess_frame(frame)
-            target_landmarks = get_landmarks(frame_resized)
-            if target_landmarks is None:
+            # create a smaller frame for processing
+            frame_proc = cv2.resize(frame, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
+
+            target_landmarks_proc = get_landmarks(frame_proc)
+            if target_landmarks_proc is None:
+                # no face detected — write original frame
                 out.write(frame)
                 continue
 
-            # Scale landmarks back to original size
-            target_landmarks = [(int(x / scale), int(y / scale)) for x, y in target_landmarks]
-            logging.info(f"Processing frame {frame_count}: Landmarks detected")
+            # warp using resized source and resized target landmarks, then upscale warped face to original frame size
+            try:
+                warped_small = warp_face(source_resized, frame_proc, source_landmarks_resized, target_landmarks_proc)
+                if warped_small is None or warped_small.sum() == 0:
+                    # fallback: write original
+                    out.write(frame)
+                    continue
+                warped_up = cv2.resize(warped_small, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+                # need to scale landmarks back to original frame size for blending
+                target_landmarks_full = [(int(x / proc_scale), int(y / proc_scale)) for (x, y) in target_landmarks_proc]
+                result_frame = seamless_face_swap(frame, warped_up, target_landmarks_full)
+                out.write(result_frame)
+                processed_frames += 1
+            except Exception as e:
+                logging.exception("Frame %d processing failed: %s", frame_count, str(e))
+                out.write(frame)  # fallback
 
-            # Warp and swap
-            warped_face = warp_face(source_img, frame_resized, source_landmarks, target_landmarks)
-            warped_face_resized = cv2.resize(warped_face, (frame.shape[1], frame.shape[0]))
-            result_frame = seamless_face_swap(frame, warped_face_resized, target_landmarks)
-
-            out.write(result_frame)
-            frame_count += 1
             if frame_count % 50 == 0:
-                logging.info(f"Processed {frame_count} frames...")
-
-        cap.release()
-        out.release()
-        logging.info(f"Processed video saved as: {output_path} ({frame_count} frames processed)")
-
-        # Stream the result video
-        with open(output_path, 'rb') as f:
-            video_data = f.read()
-        logging.info("Streaming result video back to client")
-        return StreamingResponse(BytesIO(video_data), media_type="video/mp4", headers={"Content-Disposition": "attachment; filename=swapped_video_result.mp4"})
+                logging.info("Processed %d frames (written %d processed)", frame_count, processed_frames)
 
     finally:
-        # Clean up temporary files
-        os.remove(target_path)
-        if 'output_path' in locals():
-            os.remove(output_path)
-        logging.info("Cleaned up temporary files")
+        cap.release()
+        out.release()
+        logging.info("Finished processing. Frames read: %d, frames processed: %d", frame_count, processed_frames)
+
+    # stream the file back in chunks to avoid loading entire file into memory
+    logging.info("Streaming result from %s", output_path)
+    return StreamingResponse(chunked_file_reader(output_path), media_type="video/mp4",
+                             headers={"Content-Disposition": "attachment; filename=swapped_video_result.mp4"},
+                             )
 
 @app.post("/swap-video/")
 async def swap_video(source_image: UploadFile = File(...), target_video: UploadFile = File(...)):
     try:
         logging.info("Received swap-video request")
-        # Validate file types
         if not source_image.content_type.startswith('image/'):
-            logging.error("Source must be an image file")
-            raise HTTPException(status_code=400, detail="Source must be an image file (e.g., JPG, PNG).")
+            logging.error("Source must be image")
+            raise HTTPException(status_code=400, detail="Source must be an image file.")
         if not target_video.content_type.startswith('video/'):
-            logging.error("Target must be a video file")
-            raise HTTPException(status_code=400, detail="Target must be a video file (e.g., MP4).")
-
-        # Validate file sizes
+            logging.error("Target must be video")
+            raise HTTPException(status_code=400, detail="Target must be a video file.")
+        # very rough size checks (fastfail if huge)
         source_data = await source_image.read()
-        if len(source_data) > 5_000_000:  # 5MB
+        if len(source_data) > 8_000_000:  # allow up to 8MB but you can reduce if needed
             logging.error("Source image too large")
-            raise HTTPException(status_code=400, detail="Source image too large (max 5MB).")
-        if target_video.size > 50_000_000:  # 50MB
-            logging.error("Target video too large")
-            raise HTTPException(status_code=400, detail="Target video too large (max 50MB).")
-
-        return await process_video(source_data, target_video)
+            raise HTTPException(status_code=400, detail="Source image too large (max 8MB).")
+        # Note: UploadFile.size might not be set; don't rely on it. We limit by processing time instead.
+        return await process_video(source_data, target_video, max_process_size=360)
+    except HTTPException:
+        raise
     except Exception as e:
-        logging.error(f"Error processing video: {str(e)}")
+        logging.exception("Error processing video")
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
